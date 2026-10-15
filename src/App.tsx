@@ -5,6 +5,10 @@ import * as THREE from 'three';
 import { GLTFExporter } from 'three/examples/jsm/exporters/GLTFExporter';
 import { STLExporter } from 'three/examples/jsm/exporters/STLExporter';
 
+import HandlesEditor from './components/HandlesEditor';
+import { detectPrimitives } from './geometry/detectPrimitives';
+import { buildSmoothPath, createStrokeFromPoints } from './hooks/useStrokeUtils';
+
 type Point = { x: number; y: number; pressure?: number };
 
 type Stroke = {
@@ -23,91 +27,6 @@ function clamp(value: number, min: number, max: number) {
   return Math.min(Math.max(value, min), max);
 }
 
-function distance(a: Point, b: Point) {
-  return Math.hypot(a.x - b.x, a.y - b.y);
-}
-
-function simplifyPoints(points: Point[]) {
-  if (points.length <= 2) return points;
-
-  const simplified: Point[] = [points[0]];
-  for (let i = 1; i < points.length - 1; i += 1) {
-    const current = points[i];
-    const previous = simplified[simplified.length - 1];
-    if (distance(current, previous) > 1.8) {
-      simplified.push(current);
-    }
-  }
-
-  const last = points[points.length - 1];
-  if (distance(last, simplified[simplified.length - 1]) > 1.8) {
-    simplified.push(last);
-  }
-
-  return simplified;
-}
-
-function buildSmoothPath(points: Point[]) {
-  if (points.length === 0) return '';
-  if (points.length === 1) {
-    const p = points[0];
-    return `M ${p.x} ${p.y}`;
-  }
-
-  let d = `M ${points[0].x} ${points[0].y}`;
-  for (let i = 1; i < points.length; i += 1) {
-    const previous = points[i - 1];
-    const current = points[i];
-    const midX = (previous.x + current.x) / 2;
-    const midY = (previous.y + current.y) / 2;
-
-    if (i === 1) {
-      d += ` Q ${previous.x} ${previous.y} ${midX} ${midY}`;
-    } else {
-      d += ` T ${midX} ${midY}`;
-    }
-  }
-
-  const last = points[points.length - 1];
-  const previous = points[points.length - 2];
-  const midX = (previous.x + last.x) / 2;
-  const midY = (previous.y + last.y) / 2;
-  d += ` T ${midX} ${midY}`;
-  return d;
-}
-
-function buildClosedShape(stroke: Stroke) {
-  if (stroke.points.length < 3) return null;
-
-  const shape = new THREE.Shape();
-  const first = stroke.points[0];
-  shape.moveTo(first.x, first.y);
-
-  for (let i = 1; i < stroke.points.length; i += 1) {
-    const point = stroke.points[i];
-    shape.lineTo(point.x, point.y);
-  }
-
-  if (stroke.closed) {
-    shape.closePath();
-  }
-
-  return shape;
-}
-
-function createStrokeFromPoints(points: Point[]): Stroke {
-  const cleanPoints = simplifyPoints(points);
-  const closed = distance(cleanPoints[0], cleanPoints[cleanPoints.length - 1]) < 20;
-
-  return {
-    id: Date.now() + Math.random(),
-    points: cleanPoints,
-    color: DEFAULT_COLOR,
-    width: 2.5,
-    closed,
-  };
-}
-
 export default function App() {
   const svgRef = useRef<SVGSVGElement | null>(null);
   const [activeStroke, setActiveStroke] = useState<Stroke | null>(null);
@@ -116,10 +35,37 @@ export default function App() {
   const [show3D, setShow3D] = useState(false);
   const [selectedId, setSelectedId] = useState<number | null>(null);
   const [extrudeDepth, setExtrudeDepth] = useState(0.35);
+  const [history, setHistory] = useState<Stroke[][]>([]);
+
+  const pushHistory = useCallback((next: Stroke[]) => {
+    setHistory((h) => {
+      const copy = h.slice(-49); // keep up to 50
+      copy.push(next.map(s => ({ ...s, points: s.points.slice() })));
+      return copy;
+    });
+  }, []);
+
+  const undo = useCallback(() => {
+    setHistory((h) => {
+      if (h.length === 0) return h;
+      const copy = h.slice();
+      const last = copy.pop()!;
+      setStrokes(last.map(s => ({ ...s, points: s.points.slice() })));
+      return copy;
+    });
+  }, []);
 
   const strokeToShape = useCallback((stroke: Stroke) => {
     if (stroke.points.length < 3) return null;
-    return buildClosedShape(stroke);
+    const shape = new THREE.Shape();
+    const first = stroke.points[0];
+    shape.moveTo(first.x, first.y);
+    for (let i = 1; i < stroke.points.length; i += 1) {
+      const point = stroke.points[i];
+      shape.lineTo(point.x, point.y);
+    }
+    if (stroke.closed) shape.closePath();
+    return shape;
   }, []);
 
   const toSvgContent = useCallback((items: Stroke[]) => {
@@ -144,13 +90,12 @@ export default function App() {
   }, [strokes, toSvgContent]);
 
   const exportGLTF = useCallback(() => {
-    // Build a scene with extruded shapes from closed strokes
     const scene = new THREE.Scene();
     const material = new THREE.MeshStandardMaterial({ color: '#94a3b8', metalness: 0.2, roughness: 0.8 });
 
     strokes.forEach((stroke) => {
       if (!stroke.closed) return;
-      const shape = buildClosedShape(stroke);
+      const shape = strokeToShape(stroke);
       if (!shape) return;
       const geometry = new THREE.ExtrudeGeometry(shape, { depth: extrudeDepth, bevelEnabled: false });
       const mesh = new THREE.Mesh(geometry, material);
@@ -178,7 +123,7 @@ export default function App() {
       },
       { binary: false }
     );
-  }, [strokes, extrudeDepth]);
+  }, [strokes, extrudeDepth, strokeToShape]);
 
   const exportSTL = useCallback(() => {
     const scene = new THREE.Scene();
@@ -186,7 +131,7 @@ export default function App() {
 
     strokes.forEach((stroke) => {
       if (!stroke.closed) return;
-      const shape = buildClosedShape(stroke);
+      const shape = strokeToShape(stroke);
       if (!shape) return;
       const geometry = new THREE.ExtrudeGeometry(shape, { depth: extrudeDepth, bevelEnabled: false });
       const mesh = new THREE.Mesh(geometry, material);
@@ -202,7 +147,7 @@ export default function App() {
     a.download = 'scene.stl';
     a.click();
     URL.revokeObjectURL(url);
-  }, [strokes, extrudeDepth]);
+  }, [strokes, extrudeDepth, strokeToShape]);
 
   const handlePointerDown = (event: React.PointerEvent<SVGSVGElement>) => {
     const target = event.target as Element;
@@ -240,6 +185,7 @@ export default function App() {
   const finalizeStroke = () => {
     if (!activeStroke) return;
     const finalStroke = createStrokeFromPoints(activeStroke.points);
+    pushHistory(strokes);
     setStrokes((current) => [...current, finalStroke]);
     setActiveStroke(null);
     setIsDrawing(false);
@@ -250,6 +196,7 @@ export default function App() {
   };
 
   const handleClear = () => {
+    pushHistory(strokes);
     setStrokes([]);
     setActiveStroke(null);
     setIsDrawing(false);
@@ -261,6 +208,7 @@ export default function App() {
     const last = strokes[strokes.length - 1];
     const updated = { ...last, closed: true };
 
+    pushHistory(strokes);
     setStrokes((current) => {
       const next = [...current];
       next[next.length - 1] = updated;
@@ -270,6 +218,48 @@ export default function App() {
 
   const handleSelect = (id: number) => {
     setSelectedId((cur) => (cur === id ? null : id));
+  };
+
+  const handleUpdatePoints = (points: Point[]) => {
+    if (selectedId === null) return;
+    pushHistory(strokes);
+    setStrokes((current) => current.map(s => s.id === selectedId ? { ...s, points } : s));
+  };
+
+  const handleConvertSelected = () => {
+    if (selectedId === null) return;
+    const stroke = strokes.find(s => s.id === selectedId);
+    if (!stroke) return;
+
+    const prim = detectPrimitives(stroke.points);
+    if (prim.type === 'none') {
+      alert('No se detectó una primitiva clara');
+      return;
+    }
+
+    pushHistory(strokes);
+
+    if (prim.type === 'line') {
+      const p1 = prim.p1;
+      const p2 = prim.p2;
+      const newStroke = createStrokeFromPoints([{ x: p1.x, y: p1.y }, { x: p2.x, y: p2.y }]);
+      setStrokes((cur) => cur.map(s => s.id === selectedId ? { ...newStroke, id: s.id, color: s.color, width: s.width } : s));
+      return;
+    }
+
+    if (prim.type === 'circle') {
+      const { cx, cy, r } = prim;
+      // approximate circle as N points
+      const N = 48;
+      const pts: Point[] = [];
+      for (let i = 0; i < N; i++) {
+        const theta = (i / N) * Math.PI * 2;
+        pts.push({ x: cx + r * Math.cos(theta), y: cy + r * Math.sin(theta) });
+      }
+      const newStroke = createStrokeFromPoints(pts);
+      setStrokes((cur) => cur.map(s => s.id === selectedId ? { ...newStroke, id: s.id, color: s.color, width: s.width, closed: true } : s));
+      return;
+    }
   };
 
   const previewShapes = useMemo(
@@ -292,6 +282,7 @@ export default function App() {
           <button onClick={exportGLTF}>Exportar glTF</button>
           <button onClick={exportSTL}>Exportar STL</button>
           <button className="danger" onClick={handleClear}>Borrar</button>
+          <button onClick={undo}>Undo</button>
         </div>
       </header>
 
@@ -335,6 +326,14 @@ export default function App() {
                   opacity={0.9}
                 />
               )}
+
+              {/* Handles editor overlay for selected stroke */}
+              {selectedId && (
+                (() => {
+                  const s = strokes.find(st => st.id === selectedId);
+                  return s ? <HandlesEditor svgRef={svgRef} stroke={s} onUpdate={handleUpdatePoints} /> : null;
+                })()
+              )}
             </g>
           </svg>
         </section>
@@ -346,6 +345,11 @@ export default function App() {
               <label style={{ fontSize: 12 }}>Profundidad extrusión</label>
               <input type="range" min={0.05} max={2} step={0.05} value={extrudeDepth} onChange={(e) => setExtrudeDepth(parseFloat(e.target.value))} />
               <span style={{ fontSize: 12 }}>{extrudeDepth.toFixed(2)} u</span>
+            </div>
+
+            <div style={{ display: 'flex', gap: 12, marginBottom: 8 }}>
+              <button onClick={handleConvertSelected}>Convertir a primitiva</button>
+              <button onClick={() => { setShow3D(true); }}>Forzar recompute</button>
             </div>
 
             <div className="viewer-frame">
@@ -385,6 +389,25 @@ export default function App() {
             </div>
           </aside>
         )}
+
+        {/* Right-side editing panel (mobile collapses) */}
+        <aside style={{ minWidth: 260, padding: 16 }}>
+          <h3>Editor</h3>
+          <p>Seleccionado: {selectedId ?? 'ninguno'}</p>
+          <div style={{ display: 'flex', gap: 8, marginBottom: 8 }}>
+            <button onClick={undo} disabled={history.length === 0}>Undo</button>
+            <button onClick={() => { pushHistory(strokes); setStrokes(strokes.map(s => ({ ...s })) ); }}>Snapshot</button>
+          </div>
+
+          <div style={{ marginTop: 12 }}>
+            <button onClick={handleConvertSelected} disabled={selectedId === null}>Convertir a primitiva</button>
+          </div>
+
+          <div style={{ marginTop: 12, fontSize: 13, color: '#475569' }}>
+            <p><strong>Consejo:</strong> dibuja aproximadamente líneas o círculos para que la detección funcione mejor.</p>
+            <p>Los umbrales se pueden ajustar en <code>src/geometry/detectPrimitives.ts</code>.</p>
+          </div>
+        </aside>
       </main>
     </div>
   );
