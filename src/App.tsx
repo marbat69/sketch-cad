@@ -3,7 +3,7 @@ import { OrbitControls } from '@react-three/drei';
 import { useCallback, useMemo, useRef, useState } from 'react';
 import * as THREE from 'three';
 import { GLTFExporter } from 'three/examples/jsm/exporters/GLTFExporter';
-import { STLExporter } from 'three/examples/jsm/exporters/STLExporter';
+import { buildMesh, toBinaryStl } from './lib/pencilcad-engine';
 
 type Point = { x: number; y: number; pressure?: number };
 
@@ -132,7 +132,7 @@ export default function App() {
   }, []);
 
   const exportSvg = useCallback(() => {
-    const content = `\n      <svg xmlns="http://www.w3.org/2000/svg" width="${SVG_WIDTH}" height="${SVG_HEIGHT}" viewBox="0 0 ${SVG_WIDTH} ${SVG_HEIGHT}">\n        ${toSvgContent(strokes)}\n      </svg>\n    `;
+    const content = `\n      <svg xmlns="http://www.w3.org/2000/svg" width="${SVG_WIDTH}" height="${SVG_HEIGHT}" viewBox="0 0 ${SVG_WIDTH} ${SVG_HEIGHT}">\n        ${toSvgContent(strokes)}\n      </svg>`;
 
     const blob = new Blob([content], { type: 'image/svg+xml;charset=utf-8' });
     const url = URL.createObjectURL(blob);
@@ -144,7 +144,6 @@ export default function App() {
   }, [strokes, toSvgContent]);
 
   const exportGLTF = useCallback(() => {
-    // Build a scene with extruded shapes from closed strokes
     const scene = new THREE.Scene();
     const material = new THREE.MeshStandardMaterial({ color: '#94a3b8', metalness: 0.2, roughness: 0.8 });
 
@@ -181,27 +180,29 @@ export default function App() {
   }, [strokes, extrudeDepth]);
 
   const exportSTL = useCallback(() => {
-    const scene = new THREE.Scene();
-    const material = new THREE.MeshStandardMaterial({ color: '#94a3b8' });
+    const closed = strokes.filter((s) => s.closed && s.points.length >= 3);
+    if (!closed.length) {
+      window.alert('Dibuja un perfil cerrado y pulsa Exportar STL');
+      return;
+    }
 
-    strokes.forEach((stroke) => {
-      if (!stroke.closed) return;
-      const shape = buildClosedShape(stroke);
-      if (!shape) return;
-      const geometry = new THREE.ExtrudeGeometry(shape, { depth: extrudeDepth, bevelEnabled: false });
-      const mesh = new THREE.Mesh(geometry, material);
-      scene.add(mesh);
-    });
+    try {
+      const meshes = closed.map((s) => {
+        const pts = s.points.map((p) => ({ x: p.x, y: p.y }));
+        return buildMesh(pts, extrudeDepth);
+      });
 
-    const exporter = new STLExporter();
-    const res = exporter.parse(scene);
-    const blob = new Blob([res], { type: 'application/sla' });
-    const url = URL.createObjectURL(blob);
-    const a = document.createElement('a');
-    a.href = url;
-    a.download = 'scene.stl';
-    a.click();
-    URL.revokeObjectURL(url);
+      const combined: any = { faces: meshes.flatMap((m) => m.faces) };
+      const blob = toBinaryStl(combined);
+      const url = URL.createObjectURL(blob);
+      const a = document.createElement('a');
+      a.href = url;
+      a.download = 'scene-engine.stl';
+      a.click();
+      URL.revokeObjectURL(url);
+    } catch (err: any) {
+      window.alert('Error al generar STL: ' + (err?.message || String(err)));
+    }
   }, [strokes, extrudeDepth]);
 
   const handlePointerDown = (event: React.PointerEvent<SVGSVGElement>) => {
@@ -363,7 +364,7 @@ export default function App() {
                           args={[
                             shape,
                             {
-                              depth: isSelected ? extrudeDepth : extrudeDepth,
+                              depth: extrudeDepth,
                               bevelEnabled: false,
                               steps: 1,
                             },
