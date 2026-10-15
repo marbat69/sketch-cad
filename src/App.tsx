@@ -8,7 +8,7 @@ import { STLExporter } from 'three/examples/jsm/exporters/STLExporter';
 import HandlesEditor from './components/HandlesEditor';
 import { detectPrimitives } from './geometry/detectPrimitives';
 import { buildSmoothPath, createStrokeFromPoints } from './hooks/useStrokeUtils';
-import { PrimitiveEntity, lineToPoints, circleToPoints } from './models/primitives';
+import { PrimitiveEntity, lineToPoints, circleToPoints, arcToPoints, rectToPoints } from './models/primitives';
 
 type Point = { x: number; y: number; pressure?: number };
 
@@ -38,6 +38,9 @@ export default function App() {
   const [selectedId, setSelectedId] = useState<number | null>(null);
   const [extrudeDepth, setExtrudeDepth] = useState(0.35);
   const [history, setHistory] = useState<Stroke[][]>([]);
+
+  const [confirmOpen, setConfirmOpen] = useState(false);
+  const [pendingPrimitive, setPendingPrimitive] = useState<any | null>(null);
 
   const pushHistory = useCallback((next: Stroke[]) => {
     setHistory((h) => {
@@ -238,7 +241,7 @@ export default function App() {
     }
   };
 
-  const handleConvertSelected = () => {
+  const requestConvertSelected = () => {
     if (selectedId === null) return;
     const stroke = strokes.find(s => s.id === selectedId);
     if (!stroke) return;
@@ -248,6 +251,22 @@ export default function App() {
       alert('No se detectó una primitiva clara');
       return;
     }
+
+    // open confirmation modal with candidate primitive
+    setPendingPrimitive(prim);
+    setConfirmOpen(true);
+  };
+
+  const doConvertPending = () => {
+    if (!pendingPrimitive || selectedId === null) {
+      setConfirmOpen(false);
+      setPendingPrimitive(null);
+      return;
+    }
+
+    const prim = pendingPrimitive;
+    const stroke = strokes.find(s => s.id === selectedId);
+    if (!stroke) return;
 
     pushHistory(strokes);
 
@@ -266,7 +285,6 @@ export default function App() {
       const pts = lineToPoints(entity);
       const newStroke = createStrokeFromPoints(pts as any);
       setStrokes((cur) => cur.map(s => s.id === selectedId ? { ...newStroke, id: s.id, color: s.color, width: s.width } : s));
-      return;
     }
 
     if (prim.type === 'circle') {
@@ -284,14 +302,67 @@ export default function App() {
       const pts = circleToPoints(entity as any, 64);
       const newStroke = createStrokeFromPoints(pts as any);
       setStrokes((cur) => cur.map(s => s.id === selectedId ? { ...newStroke, id: s.id, color: s.color, width: s.width, closed: true } : s));
-      return;
     }
+
+    if (prim.type === 'arc') {
+      const { cx, cy, r, startAngle, endAngle } = prim;
+      const entity: PrimitiveEntity = {
+        id: selectedId,
+        type: 'arc',
+        cx,
+        cy,
+        r,
+        startAngle,
+        endAngle,
+        color: stroke.color,
+        width: stroke.width,
+      } as PrimitiveEntity;
+      setEntities((cur) => [...cur.filter(e => e.id !== selectedId), entity]);
+      const pts = arcToPoints(entity as any, 64);
+      const newStroke = createStrokeFromPoints(pts as any);
+      setStrokes((cur) => cur.map(s => s.id === selectedId ? { ...newStroke, id: s.id, color: s.color, width: s.width } : s));
+    }
+
+    if (prim.type === 'rect') {
+      const { corners } = prim as any;
+      // create rect entity from corners
+      // compute bounding box
+      const xs = corners.map((c: any) => c.x);
+      const ys = corners.map((c: any) => c.y);
+      const minX = Math.min(...xs);
+      const maxX = Math.max(...xs);
+      const minY = Math.min(...ys);
+      const maxY = Math.max(...ys);
+      const rectEnt: PrimitiveEntity = {
+        id: selectedId,
+        type: 'rect',
+        x: minX,
+        y: minY,
+        w: maxX - minX,
+        h: maxY - minY,
+        angle: 0,
+        color: stroke.color,
+        width: stroke.width,
+      } as PrimitiveEntity;
+      setEntities((cur) => [...cur.filter(e => e.id !== selectedId), rectEnt]);
+      const pts = rectToPoints(rectEnt as any);
+      const newStroke = createStrokeFromPoints(pts as any);
+      setStrokes((cur) => cur.map(s => s.id === selectedId ? { ...newStroke, id: s.id, color: s.color, width: s.width, closed: true } : s));
+    }
+
+    setConfirmOpen(false);
+    setPendingPrimitive(null);
+  };
+
+  const cancelConvertPending = () => {
+    setConfirmOpen(false);
+    setPendingPrimitive(null);
   };
 
   const updateEntityParams = (id: number, patch: Partial<PrimitiveEntity>) => {
     setEntities((cur) => cur.map(e => e.id === id ? { ...e, ...patch } as PrimitiveEntity : e));
     // regenerate stroke from entity
-    const ent = entities.find(e => e.id === id);
+    const ent = (entities.find(e => e.id === id) );
     if (!ent) return;
     if (ent.type === 'line') {
       const pts = lineToPoints(ent as any);
@@ -300,6 +371,16 @@ export default function App() {
     }
     if (ent.type === 'circle') {
       const pts = circleToPoints(ent as any, 64);
+      const newStroke = createStrokeFromPoints(pts as any);
+      setStrokes((cur) => cur.map(s => s.id === id ? { ...newStroke, id: s.id, color: (ent as any).color ?? s.color, width: (ent as any).width ?? s.width, closed: true } : s));
+    }
+    if (ent.type === 'arc') {
+      const pts = arcToPoints(ent as any, 64);
+      const newStroke = createStrokeFromPoints(pts as any);
+      setStrokes((cur) => cur.map(s => s.id === id ? { ...newStroke, id: s.id, color: (ent as any).color ?? s.color, width: (ent as any).width ?? s.width } : s));
+    }
+    if (ent.type === 'rect') {
+      const pts = rectToPoints(ent as any);
       const newStroke = createStrokeFromPoints(pts as any);
       setStrokes((cur) => cur.map(s => s.id === id ? { ...newStroke, id: s.id, color: (ent as any).color ?? s.color, width: (ent as any).width ?? s.width, closed: true } : s));
     }
@@ -336,7 +417,7 @@ export default function App() {
           <svg
             ref={svgRef}
             className="drawing-surface"
-            viewBox={`0 0 ${SVG_WIDTH} ${SVG_HEIGHT}`}
+            viewBox={`0 0 ${SVG_WIDTH} ${SVG_HEIGHT}`} 
             onPointerDown={handlePointerDown}
             onPointerMove={handlePointerMove}
             onPointerUp={handlePointerUp}
@@ -393,7 +474,7 @@ export default function App() {
             </div>
 
             <div style={{ display: 'flex', gap: 12, marginBottom: 8 }}>
-              <button onClick={handleConvertSelected}>Convertir a primitiva</button>
+              <button onClick={requestConvertSelected}>Convertir a primitiva</button>
               <button onClick={() => { setShow3D(true); }}>Forzar recompute</button>
             </div>
 
@@ -445,7 +526,7 @@ export default function App() {
           </div>
 
           <div style={{ marginTop: 12 }}>
-            <button onClick={handleConvertSelected} disabled={selectedId === null}>Convertir a primitiva</button>
+            <button onClick={requestConvertSelected} disabled={selectedId === null}>Convertir a primitiva</button>
           </div>
 
           <div style={{ marginTop: 12, fontSize: 13, color: '#475569' }}>
@@ -486,9 +567,56 @@ export default function App() {
                   </div>
                 </div>
               )}
+
+              {selectedEntity.type === 'arc' && (
+                <div>
+                  <label>Centro</label>
+                  <div style={{ display: 'flex', gap: 8 }}>
+                    <input type="number" value={(selectedEntity as any).cx} onChange={(e) => updateEntityParams(selectedEntity.id, { cx: parseFloat(e.target.value) } as any)} />
+                    <input type="number" value={(selectedEntity as any).cy} onChange={(e) => updateEntityParams(selectedEntity.id, { cy: parseFloat(e.target.value) } as any)} />
+                  </div>
+
+                  <label>Radio</label>
+                  <div style={{ display: 'flex', gap: 8 }}>
+                    <input type="number" value={(selectedEntity as any).r} onChange={(e) => updateEntityParams(selectedEntity.id, { r: parseFloat(e.target.value) } as any)} />
+                  </div>
+
+                  <label>Start Angle (rad)</label>
+                  <input type="number" value={(selectedEntity as any).startAngle} onChange={(e) => updateEntityParams(selectedEntity.id, { startAngle: parseFloat(e.target.value) } as any)} />
+                  <label>End Angle (rad)</label>
+                  <input type="number" value={(selectedEntity as any).endAngle} onChange={(e) => updateEntityParams(selectedEntity.id, { endAngle: parseFloat(e.target.value) } as any)} />
+                </div>
+              )}
+
+              {selectedEntity.type === 'rect' && (
+                <div>
+                  <label>X</label>
+                  <input type="number" value={(selectedEntity as any).x} onChange={(e) => updateEntityParams(selectedEntity.id, { x: parseFloat(e.target.value) } as any)} />
+                  <label>Y</label>
+                  <input type="number" value={(selectedEntity as any).y} onChange={(e) => updateEntityParams(selectedEntity.id, { y: parseFloat(e.target.value) } as any)} />
+                  <label>W</label>
+                  <input type="number" value={(selectedEntity as any).w} onChange={(e) => updateEntityParams(selectedEntity.id, { w: parseFloat(e.target.value) } as any)} />
+                  <label>H</label>
+                  <input type="number" value={(selectedEntity as any).h} onChange={(e) => updateEntityParams(selectedEntity.id, { h: parseFloat(e.target.value) } as any)} />
+                </div>
+              )}
             </div>
           )}
         </aside>
+
+        {/* Confirmation modal */}
+        {confirmOpen && (
+          <div style={{ position: 'fixed', inset: 0, display: 'flex', alignItems: 'center', justifyContent: 'center', background: 'rgba(0,0,0,0.4)' }}>
+            <div style={{ background: 'white', padding: 16, borderRadius: 8, width: 360 }}>
+              <h3>Confirmar conversión</h3>
+              <p>Se detectó una primitiva de tipo <strong>{pendingPrimitive?.type}</strong>. ¿Deseas reemplazar el trazo seleccionado por esta primitiva?</p>
+              <div style={{ display: 'flex', justifyContent: 'flex-end', gap: 8, marginTop: 12 }}>
+                <button onClick={cancelConvertPending}>Cancelar</button>
+                <button onClick={doConvertPending}>Confirmar</button>
+              </div>
+            </div>
+          </div>
+        )}
       </main>
     </div>
   );
