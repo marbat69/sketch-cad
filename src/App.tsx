@@ -3,12 +3,7 @@ import { OrbitControls } from '@react-three/drei';
 import { useCallback, useMemo, useRef, useState } from 'react';
 import * as THREE from 'three';
 import { GLTFExporter } from 'three/examples/jsm/exporters/GLTFExporter';
-import { STLExporter } from 'three/examples/jsm/exporters/STLExporter';
-
-import HandlesEditor from './components/HandlesEditor';
-import { detectPrimitives } from './geometry/detectPrimitives';
-import { buildSmoothPath, createStrokeFromPoints } from './hooks/useStrokeUtils';
-import { PrimitiveEntity, lineToPoints, circleToPoints, arcToPoints, rectToPoints } from './models/primitives';
+import { buildMesh, toBinaryStl } from './lib/pencilcad-engine';
 
 type Point = { x: number; y: number; pressure?: number };
 
@@ -28,49 +23,103 @@ function clamp(value: number, min: number, max: number) {
   return Math.min(Math.max(value, min), max);
 }
 
+function distance(a: Point, b: Point) {
+  return Math.hypot(a.x - b.x, a.y - b.y);
+}
+
+function simplifyPoints(points: Point[]) {
+  if (points.length <= 2) return points;
+
+  const simplified: Point[] = [points[0]];
+  for (let i = 1; i < points.length - 1; i += 1) {
+    const current = points[i];
+    const previous = simplified[simplified.length - 1];
+    if (distance(current, previous) > 1.8) {
+      simplified.push(current);
+    }
+  }
+
+  const last = points[points.length - 1];
+  if (distance(last, simplified[simplified.length - 1]) > 1.8) {
+    simplified.push(last);
+  }
+
+  return simplified;
+}
+
+function buildSmoothPath(points: Point[]) {
+  if (points.length === 0) return '';
+  if (points.length === 1) {
+    const p = points[0];
+    return `M ${p.x} ${p.y}`;
+  }
+
+  let d = `M ${points[0].x} ${points[0].y}`;
+  for (let i = 1; i < points.length; i += 1) {
+    const previous = points[i - 1];
+    const current = points[i];
+    const midX = (previous.x + current.x) / 2;
+    const midY = (previous.y + current.y) / 2;
+
+    if (i === 1) {
+      d += ` Q ${previous.x} ${previous.y} ${midX} ${midY}`;
+    } else {
+      d += ` T ${midX} ${midY}`;
+    }
+  }
+
+  const last = points[points.length - 1];
+  const previous = points[points.length - 2];
+  const midX = (previous.x + last.x) / 2;
+  const midY = (previous.y + last.y) / 2;
+  d += ` T ${midX} ${midY}`;
+  return d;
+}
+
+function buildClosedShape(stroke: Stroke) {
+  if (stroke.points.length < 3) return null;
+
+  const shape = new THREE.Shape();
+  const first = stroke.points[0];
+  shape.moveTo(first.x, first.y);
+
+  for (let i = 1; i < stroke.points.length; i += 1) {
+    const point = stroke.points[i];
+    shape.lineTo(point.x, point.y);
+  }
+
+  if (stroke.closed) {
+    shape.closePath();
+  }
+
+  return shape;
+}
+
+function createStrokeFromPoints(points: Point[]): Stroke {
+  const cleanPoints = simplifyPoints(points);
+  const closed = distance(cleanPoints[0], cleanPoints[cleanPoints.length - 1]) < 20;
+
+  return {
+    id: Date.now() + Math.random(),
+    points: cleanPoints,
+    color: DEFAULT_COLOR,
+    width: 2.5,
+    closed,
+  };
+}
+
 export default function App() {
   const svgRef = useRef<SVGSVGElement | null>(null);
   const [activeStroke, setActiveStroke] = useState<Stroke | null>(null);
   const [strokes, setStrokes] = useState<Stroke[]>([]);
-  const [entities, setEntities] = useState<PrimitiveEntity[]>([]);
   const [isDrawing, setIsDrawing] = useState(false);
   const [show3D, setShow3D] = useState(false);
   const [selectedId, setSelectedId] = useState<number | null>(null);
   const [extrudeDepth, setExtrudeDepth] = useState(0.35);
-  const [history, setHistory] = useState<Stroke[][]>([]);
-
-  const [confirmOpen, setConfirmOpen] = useState(false);
-  const [pendingPrimitive, setPendingPrimitive] = useState<any | null>(null);
-
-  const pushHistory = useCallback((next: Stroke[]) => {
-    setHistory((h) => {
-      const copy = h.slice(-49); // keep up to 50
-      copy.push(next.map(s => ({ ...s, points: s.points.slice() })));
-      return copy;
-    });
-  }, []);
-
-  const undo = useCallback(() => {
-    setHistory((h) => {
-      if (h.length === 0) return h;
-      const copy = h.slice();
-      const last = copy.pop()!;
-      setStrokes(last.map(s => ({ ...s, points: s.points.slice() })));
-      return copy;
-    });
-  }, []);
 
   const strokeToShape = useCallback((stroke: Stroke) => {
     if (stroke.points.length < 3) return null;
-    const shape = new THREE.Shape();
-    const first = stroke.points[0];
-    shape.moveTo(first.x, first.y);
-    for (let i = 1; i < stroke.points.length; i += 1) {
-      const point = stroke.points[i];
-      shape.lineTo(point.x, point.y);
-    }
-    if (stroke.closed) shape.closePath();
-    return shape;
+    return buildClosedShape(stroke);
   }, []);
 
   const toSvgContent = useCallback((items: Stroke[]) => {
@@ -83,7 +132,7 @@ export default function App() {
   }, []);
 
   const exportSvg = useCallback(() => {
-    const content = `\n      <svg xmlns="http://www.w3.org/2000/svg" width="${SVG_WIDTH}" height="${SVG_HEIGHT}" viewBox="0 0 ${SVG_WIDTH} ${SVG_HEIGHT}">\n        ${toSvgContent(strokes)}\n      </svg>\n    `;
+    const content = `\n      <svg xmlns="http://www.w3.org/2000/svg" width="${SVG_WIDTH}" height="${SVG_HEIGHT}" viewBox="0 0 ${SVG_WIDTH} ${SVG_HEIGHT}">\n        ${toSvgContent(strokes)}\n      </svg>`;
 
     const blob = new Blob([content], { type: 'image/svg+xml;charset=utf-8' });
     const url = URL.createObjectURL(blob);
@@ -100,7 +149,7 @@ export default function App() {
 
     strokes.forEach((stroke) => {
       if (!stroke.closed) return;
-      const shape = strokeToShape(stroke);
+      const shape = buildClosedShape(stroke);
       if (!shape) return;
       const geometry = new THREE.ExtrudeGeometry(shape, { depth: extrudeDepth, bevelEnabled: false });
       const mesh = new THREE.Mesh(geometry, material);
@@ -128,31 +177,33 @@ export default function App() {
       },
       { binary: false }
     );
-  }, [strokes, extrudeDepth, strokeToShape]);
+  }, [strokes, extrudeDepth]);
 
   const exportSTL = useCallback(() => {
-    const scene = new THREE.Scene();
-    const material = new THREE.MeshStandardMaterial({ color: '#94a3b8' });
+    const closed = strokes.filter((s) => s.closed && s.points.length >= 3);
+    if (!closed.length) {
+      window.alert('Dibuja un perfil cerrado y pulsa Exportar STL');
+      return;
+    }
 
-    strokes.forEach((stroke) => {
-      if (!stroke.closed) return;
-      const shape = strokeToShape(stroke);
-      if (!shape) return;
-      const geometry = new THREE.ExtrudeGeometry(shape, { depth: extrudeDepth, bevelEnabled: false });
-      const mesh = new THREE.Mesh(geometry, material);
-      scene.add(mesh);
-    });
+    try {
+      const meshes = closed.map((s) => {
+        const pts = s.points.map((p) => ({ x: p.x, y: p.y }));
+        return buildMesh(pts, extrudeDepth);
+      });
 
-    const exporter = new STLExporter();
-    const res = exporter.parse(scene);
-    const blob = new Blob([res], { type: 'application/sla' });
-    const url = URL.createObjectURL(blob);
-    const a = document.createElement('a');
-    a.href = url;
-    a.download = 'scene.stl';
-    a.click();
-    URL.revokeObjectURL(url);
-  }, [strokes, extrudeDepth, strokeToShape]);
+      const combined: any = { faces: meshes.flatMap((m) => m.faces) };
+      const blob = toBinaryStl(combined);
+      const url = URL.createObjectURL(blob);
+      const a = document.createElement('a');
+      a.href = url;
+      a.download = 'scene-engine.stl';
+      a.click();
+      URL.revokeObjectURL(url);
+    } catch (err: any) {
+      window.alert('Error al generar STL: ' + (err?.message || String(err)));
+    }
+  }, [strokes, extrudeDepth]);
 
   const handlePointerDown = (event: React.PointerEvent<SVGSVGElement>) => {
     const target = event.target as Element;
@@ -190,7 +241,6 @@ export default function App() {
   const finalizeStroke = () => {
     if (!activeStroke) return;
     const finalStroke = createStrokeFromPoints(activeStroke.points);
-    pushHistory(strokes);
     setStrokes((current) => [...current, finalStroke]);
     setActiveStroke(null);
     setIsDrawing(false);
@@ -201,12 +251,10 @@ export default function App() {
   };
 
   const handleClear = () => {
-    pushHistory(strokes);
     setStrokes([]);
     setActiveStroke(null);
     setIsDrawing(false);
     setSelectedId(null);
-    setEntities([]);
   };
 
   const handleCloseShape = () => {
@@ -214,7 +262,6 @@ export default function App() {
     const last = strokes[strokes.length - 1];
     const updated = { ...last, closed: true };
 
-    pushHistory(strokes);
     setStrokes((current) => {
       const next = [...current];
       next[next.length - 1] = updated;
@@ -226,172 +273,10 @@ export default function App() {
     setSelectedId((cur) => (cur === id ? null : id));
   };
 
-  const handleUpdatePoints = (points: Point[]) => {
-    if (selectedId === null) return;
-    pushHistory(strokes);
-    setStrokes((current) => current.map(s => s.id === selectedId ? { ...s, points } : s));
-
-    // If selection has an entity, synchronize its params
-    const ent = entities.find(e => e.id === selectedId);
-    if (ent) {
-      if (ent.type === 'line') {
-        const [p1, p2] = lineToPoints(ent as any);
-        // no-op here; better synchronize from stroke to entity if needed
-      }
-    }
-  };
-
-  const requestConvertSelected = () => {
-    if (selectedId === null) return;
-    const stroke = strokes.find(s => s.id === selectedId);
-    if (!stroke) return;
-
-    const prim = detectPrimitives(stroke.points);
-    if (prim.type === 'none') {
-      alert('No se detectó una primitiva clara');
-      return;
-    }
-
-    // open confirmation modal with candidate primitive
-    setPendingPrimitive(prim);
-    setConfirmOpen(true);
-  };
-
-  const doConvertPending = () => {
-    if (!pendingPrimitive || selectedId === null) {
-      setConfirmOpen(false);
-      setPendingPrimitive(null);
-      return;
-    }
-
-    const prim = pendingPrimitive;
-    const stroke = strokes.find(s => s.id === selectedId);
-    if (!stroke) return;
-
-    pushHistory(strokes);
-
-    if (prim.type === 'line') {
-      const p1 = prim.p1;
-      const p2 = prim.p2;
-      const entity: PrimitiveEntity = {
-        id: selectedId,
-        type: 'line',
-        p1: { x: p1.x, y: p1.y },
-        p2: { x: p2.x, y: p2.y },
-        color: stroke.color,
-        width: stroke.width,
-      };
-      setEntities((cur) => [...cur.filter(e => e.id !== selectedId), entity]);
-      const pts = lineToPoints(entity);
-      const newStroke = createStrokeFromPoints(pts as any);
-      setStrokes((cur) => cur.map(s => s.id === selectedId ? { ...newStroke, id: s.id, color: s.color, width: s.width } : s));
-    }
-
-    if (prim.type === 'circle') {
-      const { cx, cy, r } = prim;
-      const entity: PrimitiveEntity = {
-        id: selectedId,
-        type: 'circle',
-        cx,
-        cy,
-        r,
-        color: stroke.color,
-        width: stroke.width,
-      } as PrimitiveEntity;
-      setEntities((cur) => [...cur.filter(e => e.id !== selectedId), entity]);
-      const pts = circleToPoints(entity as any, 64);
-      const newStroke = createStrokeFromPoints(pts as any);
-      setStrokes((cur) => cur.map(s => s.id === selectedId ? { ...newStroke, id: s.id, color: s.color, width: s.width, closed: true } : s));
-    }
-
-    if (prim.type === 'arc') {
-      const { cx, cy, r, startAngle, endAngle } = prim;
-      const entity: PrimitiveEntity = {
-        id: selectedId,
-        type: 'arc',
-        cx,
-        cy,
-        r,
-        startAngle,
-        endAngle,
-        color: stroke.color,
-        width: stroke.width,
-      } as PrimitiveEntity;
-      setEntities((cur) => [...cur.filter(e => e.id !== selectedId), entity]);
-      const pts = arcToPoints(entity as any, 64);
-      const newStroke = createStrokeFromPoints(pts as any);
-      setStrokes((cur) => cur.map(s => s.id === selectedId ? { ...newStroke, id: s.id, color: s.color, width: s.width } : s));
-    }
-
-    if (prim.type === 'rect') {
-      const { corners } = prim as any;
-      // create rect entity from corners
-      // compute bounding box
-      const xs = corners.map((c: any) => c.x);
-      const ys = corners.map((c: any) => c.y);
-      const minX = Math.min(...xs);
-      const maxX = Math.max(...xs);
-      const minY = Math.min(...ys);
-      const maxY = Math.max(...ys);
-      const rectEnt: PrimitiveEntity = {
-        id: selectedId,
-        type: 'rect',
-        x: minX,
-        y: minY,
-        w: maxX - minX,
-        h: maxY - minY,
-        angle: 0,
-        color: stroke.color,
-        width: stroke.width,
-      } as PrimitiveEntity;
-      setEntities((cur) => [...cur.filter(e => e.id !== selectedId), rectEnt]);
-      const pts = rectToPoints(rectEnt as any);
-      const newStroke = createStrokeFromPoints(pts as any);
-      setStrokes((cur) => cur.map(s => s.id === selectedId ? { ...newStroke, id: s.id, color: s.color, width: s.width, closed: true } : s));
-    }
-
-    setConfirmOpen(false);
-    setPendingPrimitive(null);
-  };
-
-  const cancelConvertPending = () => {
-    setConfirmOpen(false);
-    setPendingPrimitive(null);
-  };
-
-  const updateEntityParams = (id: number, patch: Partial<PrimitiveEntity>) => {
-    setEntities((cur) => cur.map(e => e.id === id ? { ...e, ...patch } as PrimitiveEntity : e));
-    // regenerate stroke from entity
-    const ent = (entities.find(e => e.id === id) );
-    if (!ent) return;
-    if (ent.type === 'line') {
-      const pts = lineToPoints(ent as any);
-      const newStroke = createStrokeFromPoints(pts as any);
-      setStrokes((cur) => cur.map(s => s.id === id ? { ...newStroke, id: s.id, color: (ent as any).color ?? s.color, width: (ent as any).width ?? s.width } : s));
-    }
-    if (ent.type === 'circle') {
-      const pts = circleToPoints(ent as any, 64);
-      const newStroke = createStrokeFromPoints(pts as any);
-      setStrokes((cur) => cur.map(s => s.id === id ? { ...newStroke, id: s.id, color: (ent as any).color ?? s.color, width: (ent as any).width ?? s.width, closed: true } : s));
-    }
-    if (ent.type === 'arc') {
-      const pts = arcToPoints(ent as any, 64);
-      const newStroke = createStrokeFromPoints(pts as any);
-      setStrokes((cur) => cur.map(s => s.id === id ? { ...newStroke, id: s.id, color: (ent as any).color ?? s.color, width: (ent as any).width ?? s.width } : s));
-    }
-    if (ent.type === 'rect') {
-      const pts = rectToPoints(ent as any);
-      const newStroke = createStrokeFromPoints(pts as any);
-      setStrokes((cur) => cur.map(s => s.id === id ? { ...newStroke, id: s.id, color: (ent as any).color ?? s.color, width: (ent as any).width ?? s.width, closed: true } : s));
-    }
-  };
-
   const previewShapes = useMemo(
     () => strokes.filter((stroke) => stroke.points.length >= 3),
     [strokes]
   );
-
-  const selectedEntity = selectedId ? entities.find(e => e.id === selectedId) ?? null : null;
 
   return (
     <div className="app-shell">
@@ -408,7 +293,6 @@ export default function App() {
           <button onClick={exportGLTF}>Exportar glTF</button>
           <button onClick={exportSTL}>Exportar STL</button>
           <button className="danger" onClick={handleClear}>Borrar</button>
-          <button onClick={undo}>Undo</button>
         </div>
       </header>
 
@@ -417,7 +301,7 @@ export default function App() {
           <svg
             ref={svgRef}
             className="drawing-surface"
-            viewBox={`0 0 ${SVG_WIDTH} ${SVG_HEIGHT}`} 
+            viewBox={`0 0 ${SVG_WIDTH} ${SVG_HEIGHT}`}
             onPointerDown={handlePointerDown}
             onPointerMove={handlePointerMove}
             onPointerUp={handlePointerUp}
@@ -452,14 +336,6 @@ export default function App() {
                   opacity={0.9}
                 />
               )}
-
-              {/* Handles editor overlay for selected stroke */}
-              {selectedId && (
-                (() => {
-                  const s = strokes.find(st => st.id === selectedId);
-                  return s ? <HandlesEditor svgRef={svgRef} stroke={s} onUpdate={handleUpdatePoints} /> : null;
-                })()
-              )}
             </g>
           </svg>
         </section>
@@ -471,11 +347,6 @@ export default function App() {
               <label style={{ fontSize: 12 }}>Profundidad extrusión</label>
               <input type="range" min={0.05} max={2} step={0.05} value={extrudeDepth} onChange={(e) => setExtrudeDepth(parseFloat(e.target.value))} />
               <span style={{ fontSize: 12 }}>{extrudeDepth.toFixed(2)} u</span>
-            </div>
-
-            <div style={{ display: 'flex', gap: 12, marginBottom: 8 }}>
-              <button onClick={requestConvertSelected}>Convertir a primitiva</button>
-              <button onClick={() => { setShow3D(true); }}>Forzar recompute</button>
             </div>
 
             <div className="viewer-frame">
@@ -493,7 +364,7 @@ export default function App() {
                           args={[
                             shape,
                             {
-                              depth: isSelected ? extrudeDepth : extrudeDepth,
+                              depth: extrudeDepth,
                               bevelEnabled: false,
                               steps: 1,
                             },
@@ -514,108 +385,6 @@ export default function App() {
               </Canvas>
             </div>
           </aside>
-        )}
-
-        {/* Right-side editing panel (mobile collapses) */}
-        <aside style={{ minWidth: 260, padding: 16 }}>
-          <h3>Editor</h3>
-          <p>Seleccionado: {selectedId ?? 'ninguno'}</p>
-          <div style={{ display: 'flex', gap: 8, marginBottom: 8 }}>
-            <button onClick={undo} disabled={history.length === 0}>Undo</button>
-            <button onClick={() => { pushHistory(strokes); setStrokes(strokes.map(s => ({ ...s })) ); }}>Snapshot</button>
-          </div>
-
-          <div style={{ marginTop: 12 }}>
-            <button onClick={requestConvertSelected} disabled={selectedId === null}>Convertir a primitiva</button>
-          </div>
-
-          <div style={{ marginTop: 12, fontSize: 13, color: '#475569' }}>
-            <p><strong>Consejo:</strong> dibuja aproximadamente líneas o círculos para que la detección funcione mejor.</p>
-            <p>Los umbrales se pueden ajustar en <code>src/geometry/detectPrimitives.ts</code>.</p>
-          </div>
-
-          {selectedEntity && (
-            <div style={{ marginTop: 12 }}>
-              <h4>Propiedades de la primitiva</h4>
-              {selectedEntity.type === 'line' && (
-                <div>
-                  <label>Endpoint A</label>
-                  <div style={{ display: 'flex', gap: 8 }}>
-                    <input type="number" value={(selectedEntity as any).p1.x} onChange={(e) => updateEntityParams(selectedEntity.id, { p1: { ...(selectedEntity as any).p1, x: parseFloat(e.target.value) } } as any)} />
-                    <input type="number" value={(selectedEntity as any).p1.y} onChange={(e) => updateEntityParams(selectedEntity.id, { p1: { ...(selectedEntity as any).p1, y: parseFloat(e.target.value) } } as any)} />
-                  </div>
-
-                  <label>Endpoint B</label>
-                  <div style={{ display: 'flex', gap: 8 }}>
-                    <input type="number" value={(selectedEntity as any).p2.x} onChange={(e) => updateEntityParams(selectedEntity.id, { p2: { ...(selectedEntity as any).p2, x: parseFloat(e.target.value) } } as any)} />
-                    <input type="number" value={(selectedEntity as any).p2.y} onChange={(e) => updateEntityParams(selectedEntity.id, { p2: { ...(selectedEntity as any).p2, y: parseFloat(e.target.value) } } as any)} />
-                  </div>
-                </div>
-              )}
-
-              {selectedEntity.type === 'circle' && (
-                <div>
-                  <label>Centro</label>
-                  <div style={{ display: 'flex', gap: 8 }}>
-                    <input type="number" value={(selectedEntity as any).cx} onChange={(e) => updateEntityParams(selectedEntity.id, { cx: parseFloat(e.target.value) } as any)} />
-                    <input type="number" value={(selectedEntity as any).cy} onChange={(e) => updateEntityParams(selectedEntity.id, { cy: parseFloat(e.target.value) } as any)} />
-                  </div>
-
-                  <label>Radio</label>
-                  <div style={{ display: 'flex', gap: 8 }}>
-                    <input type="number" value={(selectedEntity as any).r} onChange={(e) => updateEntityParams(selectedEntity.id, { r: parseFloat(e.target.value) } as any)} />
-                  </div>
-                </div>
-              )}
-
-              {selectedEntity.type === 'arc' && (
-                <div>
-                  <label>Centro</label>
-                  <div style={{ display: 'flex', gap: 8 }}>
-                    <input type="number" value={(selectedEntity as any).cx} onChange={(e) => updateEntityParams(selectedEntity.id, { cx: parseFloat(e.target.value) } as any)} />
-                    <input type="number" value={(selectedEntity as any).cy} onChange={(e) => updateEntityParams(selectedEntity.id, { cy: parseFloat(e.target.value) } as any)} />
-                  </div>
-
-                  <label>Radio</label>
-                  <div style={{ display: 'flex', gap: 8 }}>
-                    <input type="number" value={(selectedEntity as any).r} onChange={(e) => updateEntityParams(selectedEntity.id, { r: parseFloat(e.target.value) } as any)} />
-                  </div>
-
-                  <label>Start Angle (rad)</label>
-                  <input type="number" value={(selectedEntity as any).startAngle} onChange={(e) => updateEntityParams(selectedEntity.id, { startAngle: parseFloat(e.target.value) } as any)} />
-                  <label>End Angle (rad)</label>
-                  <input type="number" value={(selectedEntity as any).endAngle} onChange={(e) => updateEntityParams(selectedEntity.id, { endAngle: parseFloat(e.target.value) } as any)} />
-                </div>
-              )}
-
-              {selectedEntity.type === 'rect' && (
-                <div>
-                  <label>X</label>
-                  <input type="number" value={(selectedEntity as any).x} onChange={(e) => updateEntityParams(selectedEntity.id, { x: parseFloat(e.target.value) } as any)} />
-                  <label>Y</label>
-                  <input type="number" value={(selectedEntity as any).y} onChange={(e) => updateEntityParams(selectedEntity.id, { y: parseFloat(e.target.value) } as any)} />
-                  <label>W</label>
-                  <input type="number" value={(selectedEntity as any).w} onChange={(e) => updateEntityParams(selectedEntity.id, { w: parseFloat(e.target.value) } as any)} />
-                  <label>H</label>
-                  <input type="number" value={(selectedEntity as any).h} onChange={(e) => updateEntityParams(selectedEntity.id, { h: parseFloat(e.target.value) } as any)} />
-                </div>
-              )}
-            </div>
-          )}
-        </aside>
-
-        {/* Confirmation modal */}
-        {confirmOpen && (
-          <div style={{ position: 'fixed', inset: 0, display: 'flex', alignItems: 'center', justifyContent: 'center', background: 'rgba(0,0,0,0.4)' }}>
-            <div style={{ background: 'white', padding: 16, borderRadius: 8, width: 360 }}>
-              <h3>Confirmar conversión</h3>
-              <p>Se detectó una primitiva de tipo <strong>{pendingPrimitive?.type}</strong>. ¿Deseas reemplazar el trazo seleccionado por esta primitiva?</p>
-              <div style={{ display: 'flex', justifyContent: 'flex-end', gap: 8, marginTop: 12 }}>
-                <button onClick={cancelConvertPending}>Cancelar</button>
-                <button onClick={doConvertPending}>Confirmar</button>
-              </div>
-            </div>
-          </div>
         )}
       </main>
     </div>
