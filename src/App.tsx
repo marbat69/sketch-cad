@@ -8,6 +8,7 @@ import { STLExporter } from 'three/examples/jsm/exporters/STLExporter';
 import HandlesEditor from './components/HandlesEditor';
 import { detectPrimitives } from './geometry/detectPrimitives';
 import { buildSmoothPath, createStrokeFromPoints } from './hooks/useStrokeUtils';
+import { PrimitiveEntity, lineToPoints, circleToPoints } from './models/primitives';
 
 type Point = { x: number; y: number; pressure?: number };
 
@@ -31,6 +32,7 @@ export default function App() {
   const svgRef = useRef<SVGSVGElement | null>(null);
   const [activeStroke, setActiveStroke] = useState<Stroke | null>(null);
   const [strokes, setStrokes] = useState<Stroke[]>([]);
+  const [entities, setEntities] = useState<PrimitiveEntity[]>([]);
   const [isDrawing, setIsDrawing] = useState(false);
   const [show3D, setShow3D] = useState(false);
   const [selectedId, setSelectedId] = useState<number | null>(null);
@@ -201,6 +203,7 @@ export default function App() {
     setActiveStroke(null);
     setIsDrawing(false);
     setSelectedId(null);
+    setEntities([]);
   };
 
   const handleCloseShape = () => {
@@ -224,6 +227,15 @@ export default function App() {
     if (selectedId === null) return;
     pushHistory(strokes);
     setStrokes((current) => current.map(s => s.id === selectedId ? { ...s, points } : s));
+
+    // If selection has an entity, synchronize its params
+    const ent = entities.find(e => e.id === selectedId);
+    if (ent) {
+      if (ent.type === 'line') {
+        const [p1, p2] = lineToPoints(ent as any);
+        // no-op here; better synchronize from stroke to entity if needed
+      }
+    }
   };
 
   const handleConvertSelected = () => {
@@ -242,23 +254,54 @@ export default function App() {
     if (prim.type === 'line') {
       const p1 = prim.p1;
       const p2 = prim.p2;
-      const newStroke = createStrokeFromPoints([{ x: p1.x, y: p1.y }, { x: p2.x, y: p2.y }]);
+      const entity: PrimitiveEntity = {
+        id: selectedId,
+        type: 'line',
+        p1: { x: p1.x, y: p1.y },
+        p2: { x: p2.x, y: p2.y },
+        color: stroke.color,
+        width: stroke.width,
+      };
+      setEntities((cur) => [...cur.filter(e => e.id !== selectedId), entity]);
+      const pts = lineToPoints(entity);
+      const newStroke = createStrokeFromPoints(pts as any);
       setStrokes((cur) => cur.map(s => s.id === selectedId ? { ...newStroke, id: s.id, color: s.color, width: s.width } : s));
       return;
     }
 
     if (prim.type === 'circle') {
       const { cx, cy, r } = prim;
-      // approximate circle as N points
-      const N = 48;
-      const pts: Point[] = [];
-      for (let i = 0; i < N; i++) {
-        const theta = (i / N) * Math.PI * 2;
-        pts.push({ x: cx + r * Math.cos(theta), y: cy + r * Math.sin(theta) });
-      }
-      const newStroke = createStrokeFromPoints(pts);
+      const entity: PrimitiveEntity = {
+        id: selectedId,
+        type: 'circle',
+        cx,
+        cy,
+        r,
+        color: stroke.color,
+        width: stroke.width,
+      } as PrimitiveEntity;
+      setEntities((cur) => [...cur.filter(e => e.id !== selectedId), entity]);
+      const pts = circleToPoints(entity as any, 64);
+      const newStroke = createStrokeFromPoints(pts as any);
       setStrokes((cur) => cur.map(s => s.id === selectedId ? { ...newStroke, id: s.id, color: s.color, width: s.width, closed: true } : s));
       return;
+    }
+  };
+
+  const updateEntityParams = (id: number, patch: Partial<PrimitiveEntity>) => {
+    setEntities((cur) => cur.map(e => e.id === id ? { ...e, ...patch } as PrimitiveEntity : e));
+    // regenerate stroke from entity
+    const ent = entities.find(e => e.id === id);
+    if (!ent) return;
+    if (ent.type === 'line') {
+      const pts = lineToPoints(ent as any);
+      const newStroke = createStrokeFromPoints(pts as any);
+      setStrokes((cur) => cur.map(s => s.id === id ? { ...newStroke, id: s.id, color: (ent as any).color ?? s.color, width: (ent as any).width ?? s.width } : s));
+    }
+    if (ent.type === 'circle') {
+      const pts = circleToPoints(ent as any, 64);
+      const newStroke = createStrokeFromPoints(pts as any);
+      setStrokes((cur) => cur.map(s => s.id === id ? { ...newStroke, id: s.id, color: (ent as any).color ?? s.color, width: (ent as any).width ?? s.width, closed: true } : s));
     }
   };
 
@@ -266,6 +309,8 @@ export default function App() {
     () => strokes.filter((stroke) => stroke.points.length >= 3),
     [strokes]
   );
+
+  const selectedEntity = selectedId ? entities.find(e => e.id === selectedId) ?? null : null;
 
   return (
     <div className="app-shell">
@@ -407,6 +452,42 @@ export default function App() {
             <p><strong>Consejo:</strong> dibuja aproximadamente líneas o círculos para que la detección funcione mejor.</p>
             <p>Los umbrales se pueden ajustar en <code>src/geometry/detectPrimitives.ts</code>.</p>
           </div>
+
+          {selectedEntity && (
+            <div style={{ marginTop: 12 }}>
+              <h4>Propiedades de la primitiva</h4>
+              {selectedEntity.type === 'line' && (
+                <div>
+                  <label>Endpoint A</label>
+                  <div style={{ display: 'flex', gap: 8 }}>
+                    <input type="number" value={(selectedEntity as any).p1.x} onChange={(e) => updateEntityParams(selectedEntity.id, { p1: { ...(selectedEntity as any).p1, x: parseFloat(e.target.value) } } as any)} />
+                    <input type="number" value={(selectedEntity as any).p1.y} onChange={(e) => updateEntityParams(selectedEntity.id, { p1: { ...(selectedEntity as any).p1, y: parseFloat(e.target.value) } } as any)} />
+                  </div>
+
+                  <label>Endpoint B</label>
+                  <div style={{ display: 'flex', gap: 8 }}>
+                    <input type="number" value={(selectedEntity as any).p2.x} onChange={(e) => updateEntityParams(selectedEntity.id, { p2: { ...(selectedEntity as any).p2, x: parseFloat(e.target.value) } } as any)} />
+                    <input type="number" value={(selectedEntity as any).p2.y} onChange={(e) => updateEntityParams(selectedEntity.id, { p2: { ...(selectedEntity as any).p2, y: parseFloat(e.target.value) } } as any)} />
+                  </div>
+                </div>
+              )}
+
+              {selectedEntity.type === 'circle' && (
+                <div>
+                  <label>Centro</label>
+                  <div style={{ display: 'flex', gap: 8 }}>
+                    <input type="number" value={(selectedEntity as any).cx} onChange={(e) => updateEntityParams(selectedEntity.id, { cx: parseFloat(e.target.value) } as any)} />
+                    <input type="number" value={(selectedEntity as any).cy} onChange={(e) => updateEntityParams(selectedEntity.id, { cy: parseFloat(e.target.value) } as any)} />
+                  </div>
+
+                  <label>Radio</label>
+                  <div style={{ display: 'flex', gap: 8 }}>
+                    <input type="number" value={(selectedEntity as any).r} onChange={(e) => updateEntityParams(selectedEntity.id, { r: parseFloat(e.target.value) } as any)} />
+                  </div>
+                </div>
+              )}
+            </div>
+          )}
         </aside>
       </main>
     </div>
